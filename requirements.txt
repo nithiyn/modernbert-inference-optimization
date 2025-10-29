@@ -1,0 +1,10 @@
+torch==2.8.0
+transformers==4.54.1
+datasets==4.2.0
+numpy==2.3.4
+tqdm==4.66.4
+ninja
+packaging==24.1
+wheel==0.44.0
+accelerate==1.11.0
+torch_tensorrt
