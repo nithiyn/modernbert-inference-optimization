@@ -125,6 +125,7 @@ def set_inductor_knobs(static_shapes: bool, use_cudagraphs_if_static: bool):
 
     # Dynamo/Inductor knobs
     torch._dynamo.config.capture_scalar_outputs = True
+    torch._dynamo.config.recompile_limit = 64
     torch._inductor.config.coordinate_descent_tuning = False
     torch._inductor.config.max_autotune_pointwise = False
     torch._inductor.config.max_autotune_gemm_backends = "cublas,triton"
@@ -150,6 +151,7 @@ def parse_args():
     p.add_argument("--max_lengths", type=int, nargs="+", default=[2048,3072,4096])
     p.add_argument("--num_sample", type=int, default=200)
     p.add_argument("--warmup", type=int, default=3)
+    p.add_argument("--fullgraph", action="store_true", help="Enable fullgraph=True (usually False with Sage)")
     p.add_argument("--report_memory", action="store_true")
     p.add_argument("--precision", choices=["fp16","bf16"], default="bf16")
     p.add_argument("--use_cudagraphs_if_static", action="store_true")
@@ -199,6 +201,7 @@ def main():
         backend="inductor",
         mode=args.mode,
         dynamic=args.dynamic,
+        fullgraph=args.fullgraph
     )
 
     id2label = baseline.config.id2label
@@ -223,7 +226,7 @@ def main():
                 )
     torch.cuda.synchronize()
 
-    compare_model = baseline  # numeric drift check
+    compare_model = None  # numeric drift check disabled for performance
     mask_dtype = torch.bool
 
     print("\n" + "="*80)

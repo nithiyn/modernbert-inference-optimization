@@ -160,18 +160,20 @@ def parse_args():
     p.add_argument("--checkpoint", type=str, required=True, help="HF or local checkpoint dir")
     p.add_argument("--use_sage", action="store_true", default=True, help="Route SDPA to SageAttention")
     p.add_argument("--use_torch_compile", action="store_true", help="Wrap with torch.compile (Inductor)")
+    p.add_argument("--no_compile_attention", action="store_true", default=True,
+                   help="Exclude attention modules from compilation (recommended with Sage)")
     p.add_argument("--compile_backend", type=str, default="inductor", help="torch.compile backend")
     p.add_argument("--compile_mode", type=str, default="max-autotune-no-cudagraphs",
                    help="torch.compile mode: default, reduce-overhead, max-autotune(-no-cudagraphs)")
     p.add_argument("--compile_dynamic", action="store_true", default=True, help="Enable dynamic=True")
-    p.add_argument("--fullgraph", action="store_true", help="Enable fullgraph=True (usually False with Sage)")
+    #p.add_argument("--fullgraph", action="store_true", help="Enable fullgraph=True (usually False with Sage)")
     p.add_argument("--batch_sizes", type=int, nargs="+", default=[2, 4], help="Batch sizes")
-    p.add_argument("--max_lengths", type=int, nargs="+", default=[2048, 4096], help="Seq lengths")
+    p.add_argument("--max_lengths", type=int, nargs="+", default=[2048, 3072, 4096], help="Seq lengths")
     p.add_argument("--num_sample", type=int, default=200, help="Iterations per config")
     p.add_argument("--warmup", type=int, default=5, help="Initial warmup iters")
     p.add_argument("--report_memory", action="store_true", help="Report peak CUDA memory (MB)")
     p.add_argument("--output_file", type=str, default="benchmark_results_sage.json")
-    p.add_argument("--precision", type=str, choices=["fp16", "bf16"], default="bf16")
+    p.add_argument("--precision", type=str, choices=["fp16", "bf16"], default="fp16")
     return p.parse_args()
 
 
@@ -199,14 +201,32 @@ def _warmup_shape_buckets(model, device, vocab_size, mask_dtype, iters=3):
     torch.cuda.synchronize()
 
 
+def _exclude_attention_from_compile(model):
+    """Disable Dynamo compile for attention modules only (so Sage runs eager)."""
+    from torch._dynamo import disable
+    count = 0
+    for name, module in model.named_modules():
+        # Heuristic: typical HF stacks expose .attention.self or .attn
+        if name.endswith(("attention.self", "attn", "self_attn", "self")) or "attention" in name:
+            fwd = getattr(module, "forward", None)
+            if callable(fwd):
+                orig = fwd
+                @disable
+                def wrapped(*a, **k): return orig(*a, **k)
+                module.forward = wrapped
+                count += 1
+    return count
+
+
 if __name__ == "__main__":
     args = parse_args()
     device = "cuda"
     _maybe_setup_inductor_knobs()
 
-    # ---- Enable Sage globally (routes F.scaled_dot_product_attention -> Sage) ----
+    # ---- Enable Sage globally (route SDPA -> Sage) BEFORE model load ----
     if args.use_sage:
         F.scaled_dot_product_attention = sageattn
+        assert F.scaled_dot_product_attention is sageattn, "Sage not patched?"
         print("SageAttention enabled: SDPA calls will use Sage kernels.")
 
     print("Loading tokenizer...")
@@ -221,34 +241,27 @@ if __name__ == "__main__":
         torch_dtype=torch_dtype,
         device_map=device,
         attn_implementation="sdpa",
-        reference_compile=False,
+        #reference_compile=False,
     ).eval()
-
-    # optional: help Dynamo keep shapes symbolic
-    def mark_dyn(*tensors):
-        for t in tensors:
-            torch._dynamo.maybe_mark_dynamic(t, 0)
-            if t.ndim > 1:
-                torch._dynamo.maybe_mark_dynamic(t, 1)
 
     id2label = baseline.config.id2label
     vocab_size = baseline.config.vocab_size
 
-    compiled = None
+    model_for_run = baseline
+    engine_name = "Sage"
+
     if args.use_torch_compile:
+        if args.no_compile_attention:
+            skipped = _exclude_attention_from_compile(baseline)
+            print(f"Excluded attention from compile on {skipped} submodules.")
         print("Wrapping with torch.compile (Inductor)...")
-        compiled = torch.compile(
+        model_for_run = torch.compile(
             baseline,
             backend=args.compile_backend,
             mode=args.compile_mode,
-            dynamic=args.compile_dynamic,
-            fullgraph=args.fullgraph
+            dynamic=args.compile_dynamic
         )
-        model_for_run = compiled
-        engine_name = "Sage+Compile"
-    else:
-        model_for_run = baseline
-        engine_name = "Sage"
+        engine_name = "Sage+Compile(no-attn)" if args.no_compile_attention else "Sage+Compile"
 
     # warmup a few buckets
     _warmup_shape_buckets(
