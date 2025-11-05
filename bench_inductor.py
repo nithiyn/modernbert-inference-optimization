@@ -93,7 +93,7 @@ def run_benchmark(model, tokenizer, id2label, batch_size, max_length, num_sample
 
     peak_mem_mb = torch.cuda.max_memory_allocated() / (1024**2) if report_memory else None
     avg = lambda x: (x / num_sample) * 1000.0
-    throughput_sps = batch_size / (total_e2e / num_sample)
+    throughput_tps = (batch_size * max_length * num_sample) / total_e2e
     result = {
         "batch_size": batch_size,
         "max_length": max_length,
@@ -102,7 +102,7 @@ def run_benchmark(model, tokenizer, id2label, batch_size, max_length, num_sample
         "avg_inference_ms": round(avg(total_inf), 3),
         "avg_postprocess_ms": round(avg(total_post), 3),
         "avg_e2e_ms": round(avg(total_e2e), 3),
-        "throughput_samples_per_sec": round(throughput_sps, 2),
+        "throughput_samples_per_sec": round(throughput_tps, 2),
     }
     if compare_model is not None: result["max_abs_diff_vs_baseline"] = float(max_abs_diff)
     if peak_mem_mb is not None: result["peak_cuda_mem_mb"] = round(peak_mem_mb, 1)
@@ -283,13 +283,13 @@ def main():
     print("="*80 + "\n")
 
     print("\nSummary Table:")
-    headers = ["Engine","Batch","Seq","Tok ms","Infer ms","E2E ms","Throughput (s/s)","Max|Δ|"]
-    print(f"{headers[0]:<24} {headers[1]:<6} {headers[2]:<6} {headers[3]:<8} {headers[4]:<9} {headers[5]:<8} {headers[6]:<16} {headers[7]:<8}")
+    headers = ["Engine","Batch","Seq","Tok ms","Infer ms","E2E ms","Throughput (tok/s)","Max|Δ|"]
+    print(f"{headers[0]:<24} {headers[1]:<6} {headers[2]:<6} {headers[3]:<8} {headers[4]:<9} {headers[5]:<8} {headers[6]:<18} {headers[7]:<8}")
     print("="*112)
     for r in all_results:
         print(f"{r['engine']:<24} {r['batch_size']:<6} {r['max_length']:<6} "
               f"{r['avg_tokenize_ms']:<8.1f} {r['avg_inference_ms']:<9.1f} {r['avg_e2e_ms']:<8.1f} "
-              f"{r['throughput_samples_per_sec']:<16.2f} {r.get('max_abs_diff_vs_baseline','-'):<8}")
+              f"{r['throughput_samples_per_sec']:<18.2f} {r.get('max_abs_diff_vs_baseline','-'):<8}")
 
 if __name__ == "__main__":
     main()

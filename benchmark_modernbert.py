@@ -102,7 +102,7 @@ def run_benchmark(model, tokenizer, id2label, batch_size, max_length, num_sample
     avg_inference = total_inference_time / num_sample * 1000  # ms
     avg_postprocess = total_postprocess_time / num_sample * 1000  # ms
     avg_e2e = total_e2e_time / num_sample * 1000  # ms
-    throughput = batch_size / (total_e2e_time / num_sample)  # samples/sec
+    throughput = (batch_size * max_length * num_sample) / total_e2e_time  # tokens/sec
 
     return {
         "batch_size": batch_size,
@@ -112,7 +112,7 @@ def run_benchmark(model, tokenizer, id2label, batch_size, max_length, num_sample
         "avg_inference_ms": round(avg_inference, 3),
         "avg_postprocess_ms": round(avg_postprocess, 3),
         "avg_e2e_ms": round(avg_e2e, 3),
-        "throughput_samples_per_sec": round(throughput, 2)
+        "throughput_tokens_per_sec": round(throughput, 2)
     }
 
 
@@ -216,7 +216,7 @@ if __name__ == "__main__":
             print(f"    Inference:       {result['avg_inference_ms']:.3f} ms")
             print(f"    Post-processing: {result['avg_postprocess_ms']:.3f} ms")
             print(f"    End-to-End:      {result['avg_e2e_ms']:.3f} ms")
-            print(f"    Throughput:      {result['throughput_samples_per_sec']:.2f} samples/sec")
+            print(f"    Throughput:      {result['throughput_tokens_per_sec']:.2f} tokens/sec")
 
     # Save results to JSON
     output_data = {
@@ -235,7 +235,7 @@ if __name__ == "__main__":
 
     # Print summary table
     print("\nSummary Table:")
-    print(f"{'Batch Size':<12} {'Seq Length':<12} {'Tokenize (ms)':<15} {'Inference (ms)':<16} {'E2E (ms)':<12} {'Throughput (s/s)':<20}")
+    print(f"{'Batch Size':<12} {'Seq Length':<12} {'Tokenize (ms)':<15} {'Inference (ms)':<16} {'E2E (ms)':<12} {'Throughput (tok/s)':<20}")
     print("=" * 100)
     for result in all_results:
-        print(f"{result['batch_size']:<12} {result['max_length']:<12} {result['avg_tokenize_ms']:<15.3f} {result['avg_inference_ms']:<16.3f} {result['avg_e2e_ms']:<12.3f} {result['throughput_samples_per_sec']:<20.2f}")
+        print(f"{result['batch_size']:<12} {result['max_length']:<12} {result['avg_tokenize_ms']:<15.3f} {result['avg_inference_ms']:<16.3f} {result['avg_e2e_ms']:<12.3f} {result['throughput_tokens_per_sec']:<20.2f}")

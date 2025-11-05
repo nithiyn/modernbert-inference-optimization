@@ -138,7 +138,7 @@ def run_benchmark(
     avg_infer_ms = (total_inf / num_sample) * 1000.0
     avg_post_ms = (total_post / num_sample) * 1000.0
     avg_e2e_ms = (total_e2e / num_sample) * 1000.0
-    throughput_sps = batch_size / (total_e2e / num_sample)
+    throughput_tps = (batch_size * max_length * num_sample) / total_e2e
 
     result = {
         "batch_size": batch_size,
@@ -148,7 +148,7 @@ def run_benchmark(
         "avg_inference_ms": round(avg_infer_ms, 3),
         "avg_postprocess_ms": round(avg_post_ms, 3),
         "avg_e2e_ms": round(avg_e2e_ms, 3),
-        "throughput_samples_per_sec": round(throughput_sps, 2),
+        "throughput_samples_per_sec": round(throughput_tps, 2),
     }
     if peak_mem_mb is not None:
         result["peak_cuda_mem_mb"] = round(peak_mem_mb, 1)
@@ -326,9 +326,9 @@ if __name__ == "__main__":
     print("=" * 80 + "\n")
 
     print("\nSummary Table:")
-    headers = ["Engine", "Batch", "Seq", "Tok ms", "Infer ms", "E2E ms", "Throughput (s/s)"]
-    print(f"{headers[0]:<12} {headers[1]:<6} {headers[2]:<6} {headers[3]:<8} {headers[4]:<9} {headers[5]:<8} {headers[6]:<16}")
-    print("=" * 88)
+    headers = ["Engine", "Batch", "Seq", "Tok ms", "Infer ms", "E2E ms", "Throughput (tok/s)"]
+    print(f"{headers[0]:<12} {headers[1]:<6} {headers[2]:<6} {headers[3]:<8} {headers[4]:<9} {headers[5]:<8} {headers[6]:<18}")
+    print("=" * 90)
     for r in all_results:
         print(
             f"{r['engine']:<12} "
@@ -337,5 +337,5 @@ if __name__ == "__main__":
             f"{r['avg_tokenize_ms']:<8.1f} "
             f"{r['avg_inference_ms']:<9.1f} "
             f"{r['avg_e2e_ms']:<8.1f} "
-            f"{r['throughput_samples_per_sec']:<16.2f} "
+            f"{r['throughput_samples_per_sec']:<18.2f} "
         )

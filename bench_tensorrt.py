@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
-# bench_tensorrt.py — torch.compile JIT flow with torch_tensorrt backend (no export path)
-import os, json, time, argparse, numpy as np
+# bench_tensorrt.py — torch.compile JIT flow with torch_tensorrt backend (A10G/g5 tuned)
+
+import os, json, time, argparse, numpy as np, pathlib
 from tqdm import tqdm
 
 import torch
-import torch_tensorrt as trt  # ensures backend is registered
+import torch_tensorrt as trt  # registers 'torch_tensorrt' backend
 from transformers import AutoTokenizer, AutoModelForSequenceClassification
 
 # Reduce graph breaks from .item()
@@ -30,7 +31,7 @@ def build_inputs(tokenizer, texts, max_length, device, mask_dtype):
         padding="max_length", truncation=True
     )
     ids  = enc["input_ids"].to(device)
-    mask = enc["attention_mask"].to(mask_dtype).to(device)
+    mask = enc["attention_mask"].to(device=device, dtype=mask_dtype)
     return {"input_ids": ids, "attention_mask": mask}
 
 def postprocess(id2label, n_samples, logits: torch.Tensor):
@@ -98,110 +99,136 @@ def run_benchmark(model, tokenizer, id2label, batch_size, max_length, num_sample
         total_e2e += t_e2e
 
     peak_mem_mb = torch.cuda.max_memory_allocated() / (1024**2) if report_memory else None
-    avg = lambda x: (x / num_sample) * 1000.0
-    throughput_sps = batch_size / (total_e2e / num_sample)
+    ms = lambda secs: (secs / num_sample) * 1000.0
+    throughput_tokens_per_sec = (batch_size * max_length * num_sample) / total_e2e
     result = {
         "batch_size": batch_size,
         "max_length": max_length,
         "num_samples": num_sample,
-        "avg_tokenize_ms": round(avg(total_tok), 3),
-        "avg_inference_ms": round(avg(total_inf), 3),
-        "avg_postprocess_ms": round(avg(total_post), 3),
-        "avg_e2e_ms": round(avg(total_e2e), 3),
-        "throughput_samples_per_sec": round(throughput_sps, 2),
+        "avg_tokenize_ms": round(ms(total_tok), 3),
+        "avg_inference_ms": round(ms(total_inf), 3),
+        "avg_postprocess_ms": round(ms(total_post), 3),
+        "avg_e2e_ms": round(ms(total_e2e), 3),
+        "throughput_tokens_per_sec": round(throughput_tokens_per_sec, 2),
     }
     if compare_model is not None: result["max_abs_diff_vs_baseline"] = float(max_abs_diff)
     if peak_mem_mb is not None: result["peak_cuda_mem_mb"] = round(peak_mem_mb, 1)
     return result
 
 
-# --------------------------- TRT config (JIT flow only) ---------------------------
-
-def set_min_block_size_everywhere(min_block_size: int) -> str:
-    """
-    Try all known knobs to force the TRT partitioner min_block_size in JIT flow.
-    Returns a short status string describing what worked.
-    """
-    torch.backends.cuda.matmul.allow_tf32 = True
-    torch.set_float32_matmul_precision("high")
-
-    tried = []
-    ok = False
-
-    # (A) Newer public API
-    try:
-        import torch_tensorrt.dynamo.partitioning as part
-        if hasattr(part, "set_min_block_size"):
-            part.set_min_block_size(int(min_block_size))
-            tried.append("partitioning.set_min_block_size")
-            ok = True
-    except Exception as e:
-        tried.append(f"partitioning.set_min_block_size[err:{type(e).__name__}]")
-
-    # (B) Older internal settings object
-    if not ok:
-        try:
-            from torch_tensorrt.dynamo import _compiler
-            if hasattr(_compiler, "settings"):
-                _compiler.settings.min_block_size = int(min_block_size)
-                tried.append("_compiler.settings.min_block_size")
-                ok = True
-        except Exception as e:
-            tried.append(f"_compiler.settings.min_block_size[err:{type(e).__name__}]")
-
-    # (C) Direct attribute (some builds expose it)
-    if not ok:
-        try:
-            from torch_tensorrt.dynamo import _compiler
-            if hasattr(_compiler, "min_block_size"):
-                setattr(_compiler, "min_block_size", int(min_block_size))
-                tried.append("_compiler.min_block_size")
-                ok = True
-        except Exception as e:
-            tried.append(f"_compiler.min_block_size[err:{type(e).__name__}]")
-
-    status = "APPLIED" if ok else "NOT_AVAILABLE"
-    print(f"[TRT] min_block_size target={min_block_size} status={status} tried={tried}")
-    return status
+# --------------------------- TRT compile (JIT flow only) ---------------------------
 
 def compile_with_torch_compile(baseline, args):
-    # ensure the backend is visible
     backends = set(torch._dynamo.list_backends())
     if "torch_tensorrt" not in backends:
         raise RuntimeError(f"torch_tensorrt backend not registered; backends={sorted(backends)}")
-    print(f"Compiling with torch.compile backend=torch_tensorrt, "
-          f"mode={args.mode}, dynamic={args.dynamic}, fullgraph={args.fullgraph}")
+
+    enabled_prec = {torch.bfloat16} if args.precision == "bf16" else {torch.half}
+
+    # Optionally keep FA2 on Torch side
+    FA2_OPS = set()
+    if args.keep_fa2:
+        FA2_OPS = {
+            "aten._scaled_dot_product_flash_attention.default",
+            "aten.scaled_dot_product_attention.default",
+        }
+
+    device_setting = trt.Device(f"cuda:{args.gpu_id}")
+
+    # Ensure timing cache path exists
+    if args.timing_cache_path:
+        pathlib.Path(args.timing_cache_path).parent.mkdir(parents=True, exist_ok=True)
+
+    options = {
+        # Target device + portability
+        "device": device_setting,
+        "hardware_compatible": args.hardware_compatible,
+
+        # Partition quality
+        "min_block_size": args.trt_min_block_size,
+        "torch_executed_ops": FA2_OPS,
+
+        # Builder quality / search
+        "optimization_level": args.optimization_level,   # 0..5
+        "workspace_size": args.workspace_size,           # bytes
+        "num_avg_timing_iters": args.num_avg_timing_iters,
+
+        # Dtypes / typing
+        "enabled_precisions": enabled_prec,
+        "use_explicit_typing": False,
+
+        # Caching for stability & speed
+        "timing_cache_path": args.timing_cache_path or "",
+        "cache_built_engines": True,
+        "reuse_cached_engines": True,
+
+        # Runtime / partitioner
+        "use_python_runtime": args.use_python_runtime,
+        "use_fast_partitioner": True,
+    }
+
+    if args.dump_partitions:
+        options["dryrun"] = args.dump_partitions  # file path to write partition summary
+
+    print("Compiling with torch.compile(backend='torch_tensorrt')")
+    print(f"  dynamic={args.dynamic}, fullgraph={args.fullgraph}")
+    print(f"  device=cuda:{args.gpu_id}, hw_compat={args.hardware_compatible}")
+    print(f"  options={{min_block_size={options['min_block_size']}, "
+          f"opt_level={options['optimization_level']}, "
+          f"workspace_size={options['workspace_size']}, "
+          f"num_avg_timing_iters={options['num_avg_timing_iters']}, "
+          f"explicit_typing={options['use_explicit_typing']}, "
+          f"fast_partitioner={options['use_fast_partitioner']}}}")
+
     return torch.compile(
         baseline,
         backend="torch_tensorrt",
-        mode=args.mode,
-        dynamic=args.dynamic,
+        dynamic=args.dynamic,    # keep False for bucketed shapes
         fullgraph=args.fullgraph,
+        options=options,
     )
 
 
 # --------------------------- CLI ---------------------------
 
 def parse_args():
-    p = argparse.ArgumentParser("Benchmark ModernBERT with TensorRT via torch.compile (JIT flow)")
+    p = argparse.ArgumentParser("Benchmark ModernBERT with TensorRT via torch.compile (A10G/g5 tuned)")
     p.add_argument("--checkpoint", type=str, required=True)
     p.add_argument("--attn_impl", type=str, default="flash_attention_2",
                    help="{flash_attention_2, sdpa, eager} (fullgraph forces sdpa)")
-    p.add_argument("--mode", type=str, default=None, help="suggest 'max-autotune'")
     p.add_argument("--dynamic", action="store_true", help="torch.compile(dynamic=True)")
     p.add_argument("--fullgraph", action="store_true", help="torch.compile(..., fullgraph=True)")
     p.add_argument("--static_shapes", action="store_true", help="Pin shapes (often best for TRT)")
     p.add_argument("--static_b", type=int, default=4)
     p.add_argument("--static_s", type=int, default=2048)
-    # ranges kept for future dynamic profile work (unused in this pure-static script)
-    p.add_argument("--dyn_batch_min", type=int, default=1)
-    p.add_argument("--dyn_batch_max", type=int, default=4)
-    p.add_argument("--dyn_seq_min", type=int, default=0)
-    p.add_argument("--dyn_seq_max", type=int, default=0)
-    p.add_argument("--trt_min_block_size", type=int, default=1)
+
+    # Device / portability
+    p.add_argument("--gpu_id", type=int, default=0, help="CUDA device id (A10G on g5)")
+    p.add_argument("--hardware_compatible", action="store_true",
+                   help="Build more portable TRT engines (disable for max perf on this GPU)")
+
+    # TensorRT compilation options
+    p.add_argument("--trt_min_block_size", type=int, default=16,
+                   help="Minimum ops per TRT subgraph (raise to avoid tiny partitions)")
+    p.add_argument("--optimization_level", type=int, default=5, help="TRT builder optimization level (0-5)")
+    p.add_argument("--workspace_size", type=int, default=(2<<30),  # 2 GiB
+                   help="TRT max workspace size in bytes")
+    p.add_argument("--num_avg_timing_iters", type=int, default=3,
+                   help="Avg timing iters for tactic selection")
+    p.add_argument("--use_python_runtime", action="store_true",
+                   help="Force Python runtime instead of C++ runtime")
+    p.add_argument("--timing_cache_path", type=str, default="/tmp/trt_tactics.cache",
+                   help="Timing cache file path (reused across runs)")
+
+    # Partitioning helpers
+    p.add_argument("--keep_fa2", action="store_true",
+                   help="Force Flash-Attn / SDPA ops to stay on Torch side (recommended)")
+    p.add_argument("--dump_partitions", type=str, default="",
+                   help="Write TRT partition summary to this path")
+
     # sweep/run knobs
-    p.add_argument("--batch_sizes", type=int, nargs="+", default=[4])
-    p.add_argument("--max_lengths", type=int, nargs="+", default=[2048])
+    p.add_argument("--batch_sizes", type=int, nargs="+", default=[2, 4])
+    p.add_argument("--max_lengths", type=int, nargs="+", default=[2048, 3072, 4096])
     p.add_argument("--num_sample", type=int, default=100)
     p.add_argument("--warmup", type=int, default=3)
     p.add_argument("--report_memory", action="store_true")
@@ -214,13 +241,11 @@ def parse_args():
 
 def main():
     args = parse_args()
-    device = "cuda"
+    device = f"cuda:{args.gpu_id}"
 
-    if args.mode is None:
-        args.mode = "max-autotune"
-
-    # Force min_block_size for JIT flow (tries multiple APIs; prints what stuck)
-    set_min_block_size_everywhere(args.trt_min_block_size)
+    # CUDA math knobs for Ampere (A10G)
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.set_float32_matmul_precision("high")
 
     print("Loading tokenizer...")
     tokenizer = AutoTokenizer.from_pretrained("answerdotai/ModernBERT-base")
@@ -228,17 +253,16 @@ def main():
 
     attn_impl = args.attn_impl
     if args.fullgraph and attn_impl == "flash_attention_2":
-        print("[WARN] TensorRT fullgraph + FA2 is incompatible. Switching attention to 'sdpa'.")
+        print("[WARN] fullgraph + FA2 is incompatible for TRT; switching to 'sdpa'.")
         attn_impl = "sdpa"
 
     print(f"Loading model from {args.checkpoint} (dtype={args.precision}, attn={attn_impl})...")
     baseline = AutoModelForSequenceClassification.from_pretrained(
         args.checkpoint,
         torch_dtype=torch_dtype,
-        device_map="cuda",
         attn_implementation=attn_impl,
         reference_compile=False,
-    ).eval()
+    ).eval().to(device)
 
     id2label = baseline.config.id2label
     vocab_size = baseline.config.vocab_size
@@ -251,28 +275,30 @@ def main():
         batch_sizes = args.batch_sizes
         max_lengths = args.max_lengths
 
-    mask_dtype = torch.int32  # TRT prefers int32 masks
+    # IMPORTANT: float mask to avoid TRT Int32/Float type fights
+    mask_dtype = torch.bool
 
     # compile with torch.compile (JIT backend)
     compiled = compile_with_torch_compile(baseline, args)
 
-    # warmup a couple buckets (or the single static shape)
-    warm_shapes = ([(batch_sizes[0], max_lengths[0])]
-                   if args.static_shapes else [(2,2048), (2,4096), (4,2048)])
+    # warm ALL buckets you’ll test to avoid recompiles mid-run
+    warm_shapes = [(b, s) for b in batch_sizes for s in max_lengths]
     with torch.inference_mode():
         for _ in range(max(1, args.warmup)):
-            for B,S in warm_shapes:
+            for B, S in warm_shapes:
                 _ = compiled(
-                    input_ids=torch.randint(0, vocab_size, (B,S), device=device, dtype=torch.long),
-                    attention_mask=torch.ones((B,S), device=device, dtype=mask_dtype),
+                    input_ids=torch.randint(0, vocab_size, (B, S), device=device, dtype=torch.long),
+                    attention_mask=torch.ones((B, S), device=device, dtype=mask_dtype),
                 )
     torch.cuda.synchronize()
 
-    compare_model = baseline  # numeric drift check
+    compare_model = None  # set to baseline to check numeric drift
 
     print("\n" + "="*80)
     print("Starting benchmark sweep (TensorRT, torch.compile JIT)")
-    print(f"  Mode: {args.mode}  Dynamic: {args.dynamic}  Fullgraph: {args.fullgraph}  StaticShapes: {args.static_shapes}")
+    print(f"  Device: {device}  Dynamic: {args.dynamic}  Fullgraph: {args.fullgraph}  StaticShapes: {args.static_shapes}")
+    print(f"  TensorRT: min_block_size={args.trt_min_block_size}, opt_level={args.optimization_level}, "
+          f"workspace={args.workspace_size}, timing_avg={args.num_avg_timing_iters}, keep_fa2={args.keep_fa2}")
     print(f"  Batch sizes: {batch_sizes}")
     print(f"  Sequence lengths: {max_lengths}")
     print(f"  Samples per config: {args.num_sample}")
@@ -304,7 +330,7 @@ def main():
             print(f"    Inference:       {result['avg_inference_ms']:.3f} ms")
             print(f"    Post-processing: {result['avg_postprocess_ms']:.3f} ms")
             print(f"    End-to-End:      {result['avg_e2e_ms']:.3f} ms")
-            print(f"    Throughput:      {result['throughput_samples_per_sec']:.2f} samples/sec")
+            print(f"    Throughput:      {result['throughput_tokens_per_sec']:.2f} tokens/sec")
             if 'max_abs_diff_vs_baseline' in result:
                 print(f"    Max |Δ| vs baseline logits: {result['max_abs_diff_vs_baseline']:.4f}")
             if 'peak_cuda_mem_mb' in result and result['peak_cuda_mem_mb'] is not None:
@@ -313,7 +339,7 @@ def main():
     payload = {
         "model_checkpoint": args.checkpoint,
         "backend": "torch_tensorrt",
-        "device": "cuda",
+        "device": device,
         "results": all_results,
     }
     with open(args.output_file, "w") as f:
@@ -324,13 +350,13 @@ def main():
     print("="*80 + "\n")
 
     print("\nSummary Table:")
-    headers = ["Engine","Batch","Seq","Tok ms","Infer ms","E2E ms","Throughput (s/s)","Max|Δ|"]
-    print(f"{headers[0]:<28} {headers[1]:<6} {headers[2]:<6} {headers[3]:<8} {headers[4]:<9} {headers[5]:<8} {headers[6]:<16} {headers[7]:<8}")
-    print("="*116)
+    headers = ["Engine","Batch","Seq","Tok ms","Infer ms","E2E ms","Throughput (tok/s)","Max|Δ|"]
+    print(f"{headers[0]:<28} {headers[1]:<6} {headers[2]:<6} {headers[3]:<8} {headers[4]:<9} {headers[5]:<8} {headers[6]:<18} {headers[7]:<8}")
+    print("="*118)
     for r in all_results:
         print(f"{r['engine']:<28} {r['batch_size']:<6} {r['max_length']:<6} "
               f"{r['avg_tokenize_ms']:<8.1f} {r['avg_inference_ms']:<9.1f} {r['avg_e2e_ms']:<8.1f} "
-              f"{r['throughput_samples_per_sec']:<16.2f} {r.get('max_abs_diff_vs_baseline','-'):<8}")
+              f"{r['throughput_tokens_per_sec']:<18.2f} {r.get('max_abs_diff_vs_baseline','-'):<8}")
 
 if __name__ == "__main__":
     main()
