@@ -112,11 +112,24 @@ python bench_inductor.py \
 ### TensorRT Compilation
 
 ```bash
-# TensorRT AOT (torch.export path)
-python build_trt_engine_eager.py
+# TensorRT AOT (torch.export path with static shapes)
+python build_trt_engine_eager.py \
+  --checkpoint ./bf16_checkpoints \
+  --precision bf16 \
+  --static_b 2 \
+  --static_s 4096 \
+  --num_sample 100 \
+  --report_memory \
+  --save_ts modernbert_trt_static.ts
 
-# TensorRT Hybrid Graph (torch.compile backend)
-python tensorrt-hybrid_graph.py
+# TensorRT JIT (torch.compile backend with dynamic shapes)
+python bench_tensorrt.py \
+  --checkpoint ./bf16_checkpoints \
+  --precision bf16 \
+  --attn_impl sdpa \
+  --batch_sizes 2 4 \
+  --max_lengths 2048 3072 4096 \
+  --num_sample 100
 ```
 
 ## Scripts
@@ -192,23 +205,35 @@ All attention benchmarks use:
 Metrics reported:
 - **Tok ms**: Tokenization latency
 - **Infer ms**: Model forward pass latency
-- **E2E ms**: End-to-end latency (tokenization + inference)
+- **Post ms**: Post-processing latency (argmax, softmax, label mapping)
+- **E2E ms**: End-to-end latency (tokenization + inference + post-processing)
 - **Throughput**: Tokens processed per second
 
 ## Compilation Strategies
 
-### 2. Torch-TensorRT AOT (torch.export)
+### 1. Torch-TensorRT AOT (torch.export)
 
-Ahead-of-time compilation via `torch.export` + `torch_tensorrt.dynamo.compile()`. Works best in strict mode with `require_full_compilation=True`.
+Ahead-of-time compilation via `torch.export` + `torch_tensorrt.dynamo.compile()`. Best for production deployment with fixed shapes.
 
-**Key settings:**
+**Key characteristics:**
+- Requires `attn_implementation="eager"` (SDPA) - FA2 not supported
+- Static shapes only - no dynamic batching
+- Full graph compilation with `require_full_compilation=True`
+- Produces serializable TorchScript artifact for deployment
 - Set `reference_compile=False` to avoid double-tracing issues
-- Use realistic dynamic ranges: `min_shape=(2, 512), opt_shape=(8, 1024), max_shape=(8, 2048)`
-- Enable `enabled_precisions={torch.bfloat16}` for BF16 precision
-- Narrower shape ranges yield faster engines
 
-**TensorRT input specification:**
+**Static shape specification:**
 ```python
+# For static shapes, use simple tuple
+torch_tensorrt.Input(
+    (batch_size, seq_len),
+    dtype=torch.long
+)
+```
+
+**For dynamic shapes (not recommended for AOT):**
+```python
+# Use min/opt/max ranges
 torch_tensorrt.Input(
     min_shape=(2, 512),
     opt_shape=(8, 1024),
@@ -218,6 +243,24 @@ torch_tensorrt.Input(
 ```
 
 Never specify both `shape` and `min_shape/opt_shape/max_shape` — choose static or dynamic, not both.
+
+**Compilation settings:**
+```python
+trt_gm = torch_tensorrt.dynamo.compile(
+    exported_program,
+    inputs=trt_inputs,
+    device=torch_tensorrt.Device("cuda:0"),
+    enabled_precisions={torch.bfloat16},
+    require_full_compilation=True,
+    optimization_level=5,
+    workspace_size=(2 << 30),  # 2GB
+    min_block_size=5,
+    use_fast_partitioner=True,
+    enable_experimental_decompositions=True,
+    cache_built_engines=True,
+    reuse_cached_engines=True,
+)
+```
 
 ## Aggressive TensorRT Optimization
 
@@ -242,29 +285,46 @@ trt_model = torch_tensorrt.dynamo.compile(
 )
 ```
 
-### 3. Torch-Compile Hybrid Graph (torch.compile + TensorRT Backend)
+### 2. Torch-Compile JIT (torch.compile + TensorRT Backend)
 
 Just-in-time compilation with `torch.compile(model, backend="torch_tensorrt")`. More flexible than AOT, allows hybrid fallback where unsupported ops run in PyTorch.
 
-**Pros:** Works with FlashAttention2, handles dynamic shapes
-**Cons:** Partial TensorRT coverage, graph breaks at unsupported ops
+**Pros:** Works with FlashAttention2, handles dynamic shapes, no pre-export needed
+**Cons:** Partial TensorRT coverage, graph breaks at unsupported ops, runtime compilation overhead
 
 **Configuration:**
 ```python
 compiled = torch.compile(
     model, 
     backend="torch_tensorrt",
-    dynamic=True
+    dynamic=True,
+    options={
+        "device": torch_tensorrt.Device("cuda:0"),
+        "enabled_precisions": {torch.bfloat16},
+        "optimization_level": 5,
+        "min_block_size": 16,
+        "keep_fa2": True,  # Keep Flash Attention on PyTorch side
+    }
 )
 ```
 
 For experimentation, use `torch._dynamo.config.suppress_errors = True` to silently fall back to eager execution on tracing failures.
 
-### 4. Torch.compile (Inductor Backend)
+### 3. Torch.compile (Inductor Backend)
 
-Pure PyTorch compilation without TensorRT. Best compatibility with FA2 kernels.
+Pure PyTorch compilation without TensorRT. Best compatibility with FA2 kernels and delivers the best performance.
 
 **Mode:** `max-autotune-no-cudagraphs` (CUDA Graphs disabled due to incompatibilities)
+
+**Configuration:**
+```python
+compiled = torch.compile(
+    model,
+    backend="inductor",
+    mode="max-autotune-no-cudagraphs",
+    dynamic=False  # Static shapes for best performance
+)
+```
 
 ## CUDA Graphs Limitations
 
@@ -288,57 +348,63 @@ ModernBERT checkpoints are stored in bfloat16. Use BF16 throughout the pipeline:
 
 ### Baseline (Eager Execution)
 
-| Batch | Seq  | Tokenization time ms | Infer ms | E2E ms | Throughput (tok/s) |
-|-------|------|--------|----------|--------|--------------------|
-| 2     | 2048 | 6.5    | 33.7     | 40.7   | 100,764            |
-| 2     | 3072 | 9.7    | 44.7     | 54.5   | 112,688            |
-| 2     | 4096 | 12.5   | 63.2     | 75.9   | 107,901            |
-| 4     | 2048 | 9.0    | 56.4     | 65.6   | 124,824            |
-| 4     | 3072 | 13.3   | 87.4     | 100.9  | 121,740            |
-| 4     | 4096 | 17.2   | 121.8    | 139.3  | 117,605            |
+| Batch Size | Seq Length | Tokenization Latency (ms) | Inference Latency (ms) | Post-processing Latency (ms) | End-to-End Latency (ms) | Throughput (tokens/sec) |
+|------------|------------|---------------------------|------------------------|------------------------------|-------------------------|-------------------------|
+| 2          | 2048       | 7.1                       | 34.1                   | 1.3                          | 42.5                    | 96,351                  |
+| 2          | 3072       | 10.2                      | 45.0                   | 0.2                          | 55.4                    | 110,813                 |
+| 2          | 4096       | 13.6                      | 63.5                   | 0.3                          | 77.4                    | 105,825                 |
+| 2          | 8192       | 25.3                      | 148.8                  | 0.3                          | 174.4                   | 93,919                  |
+| 4          | 2048       | 10.8                      | 56.6                   | 0.3                          | 67.7                    | 120,916                 |
+| 4          | 3072       | 16.6                      | 87.6                   | 0.3                          | 104.5                   | 117,571                 |
+| 4          | 4096       | 21.0                      | 121.9                  | 0.3                          | 143.3                   | 114,354                 |
+| 4          | 8192       | 42.0                      | 290.5                  | 0.3                          | 332.9                   | 98,447                  |
 
 ### Torch.compile (Inductor + Flash Attention 2)
 
 static shapes with warmup, FA2 kernels:
 
-| Engine                  | Batch | Seq  | Tokenization time ms | Infer ms | E2E ms | Throughput (tok/s) |
-|-------------------------|-------|------|--------|----------|--------|--------------------|
-| torch.compile[inductor] | 2     | 2048 | 6.6    | 25.6     | 32.7   | 125,382            |
-| torch.compile[inductor] | 2     | 3072 | 9.7    | 40.3     | 50.2   | 122,309            |
-| torch.compile[inductor] | 2     | 4096 | 12.4   | 55.2     | 67.9   | 120,727            |
-| torch.compile[inductor] | 4     | 2048 | 9.1    | 47.9     | 57.2   | 143,162            |
-| torch.compile[inductor] | 4     | 3072 | 13.4   | 75.7     | 89.4   | 137,474            |
-| torch.compile[inductor] | 4     | 4096 | 17.5   | 106.9    | 124.7  | 131,398            |
+| Engine                  | Batch Size | Seq Length | Tokenization Latency (ms) | Inference Latency (ms) | Post-processing Latency (ms) | End-to-End Latency (ms) | Throughput (tokens/sec) |
+|-------------------------|------------|------------|---------------------------|------------------------|------------------------------|-------------------------|-------------------------|
+| torch.compile[inductor] | 2          | 2048       | 7.1                       | 26.1                   | 0.5                          | 33.8                    | 121,290                 |
+| torch.compile[inductor] | 2          | 3072       | 10.4                      | 40.6                   | 0.2                          | 51.3                    | 119,722                 |
+| torch.compile[inductor] | 2          | 4096       | 13.5                      | 55.6                   | 0.2                          | 69.4                    | 117,960                 |
+| torch.compile[inductor] | 2          | 8192       | 25.4                      | 134.0                  | 0.3                          | 159.7                   | 102,574                 |
+| torch.compile[inductor] | 4          | 2048       | 10.8                      | 48.3                   | 0.2                          | 59.4                    | 137,844                 |
+| torch.compile[inductor] | 4          | 3072       | 16.2                      | 76.0                   | 0.2                          | 92.6                    | 132,644                 |
+| torch.compile[inductor] | 4          | 4096       | 21.2                      | 106.6                  | 0.3                          | 128.1                   | 127,856                 |
+| torch.compile[inductor] | 4          | 8192       | 41.9                      | 262.1                  | 0.3                          | 304.4                   | 107,638                 |
 
 **Note:** Significantly improved inference latency with FA2 compared to eager attention baseline.
 
-### Torch.compile (TensorRT Backend + Flash Attention 2)
+### Torch.compile (TensorRT JIT Backend + Flash Attention 2)
 
 JIT compilation with torch_tensorrt backend:
 
-| Engine                        | Batch | Seq  | Tokenization time ms | Infer ms | E2E ms | Throughput (tok/s) |
-|-------------------------------|-------|------|--------|----------|--------|--------------------|
-| torch.compile[torch_tensorrt] | 2     | 2048 | 6.6    | 33.9     | 40.9   | 100,241            |
-| torch.compile[torch_tensorrt] | 2     | 3072 | 9.7    | 46.8     | 56.7   | 108,345            |
-| torch.compile[torch_tensorrt] | 2     | 4096 | 12.4   | 65.2     | 77.9   | 105,214            |
-| torch.compile[torch_tensorrt] | 4     | 2048 | 9.7    | 58.2     | 68.1   | 120,215            |
-| torch.compile[torch_tensorrt] | 4     | 3072 | 14.0   | 87.8     | 102.2  | 120,258            |
-| torch.compile[torch_tensorrt] | 4     | 4096 | 18.4   | 122.2    | 140.9  | 116,245            |
+| Engine                        | Batch Size | Seq Length | Tokenization Latency (ms) | Inference Latency (ms) | Post-processing Latency (ms) | End-to-End Latency (ms) | Throughput (tokens/sec) |
+|-------------------------------|------------|------------|---------------------------|------------------------|------------------------------|-------------------------|-------------------------|
+| torch.compile[torch_tensorrt] | 2          | 2048       | 6.6                       | 33.9                   | 0.2                          | 40.9                    | 100,241                 |
+| torch.compile[torch_tensorrt] | 2          | 3072       | 9.7                       | 46.8                   | 0.2                          | 56.7                    | 108,345                 |
+| torch.compile[torch_tensorrt] | 2          | 4096       | 12.4                      | 65.2                   | 0.2                          | 77.9                    | 105,214                 |
+| torch.compile[torch_tensorrt] | 4          | 2048       | 9.7                       | 58.2                   | 0.2                          | 68.1                    | 120,215                 |
+| torch.compile[torch_tensorrt] | 4          | 3072       | 14.0                      | 87.8                   | 0.2                          | 102.2                   | 120,258                 |
+| torch.compile[torch_tensorrt] | 4          | 4096       | 18.4                      | 122.2                  | 0.3                          | 140.9                   | 116,245                 |
 
-**Note:** TensorRT backend shows similar performance to eager baseline, suggesting limited TensorRT optimization with FA2 kernels.
+**Note:** TensorRT JIT backend shows similar performance to eager baseline, suggesting limited TensorRT optimization with FA2 kernels.
 
 ### SageAttention + Torch.compile (No Attention Compilation)
 
 Using SageAttention with torch.compile but excluding attention from Triton compilation:
 
-| Engine                | Batch | Seq  | Tokenization time ms | Infer ms | E2E ms | Throughput (tok/s) |
-|-----------------------|-------|------|--------|----------|--------|--------------------|
-| Sage+Compile(no-attn) | 2     | 2048 | 6.6    | 37.2     | 44.2   | 92,610             |
-| Sage+Compile(no-attn) | 2     | 3072 | 9.8    | 62.7     | 72.7   | 84,456             |
-| Sage+Compile(no-attn) | 2     | 4096 | 13.0   | 87.4     | 100.6  | 81,429             |
-| Sage+Compile(no-attn) | 4     | 2048 | 9.5    | 73.0     | 82.8   | 98,905             |
-| Sage+Compile(no-attn) | 4     | 3072 | 14.1   | 113.9    | 128.3  | 95,796             |
-| Sage+Compile(no-attn) | 4     | 4096 | 18.4   | 164.3    | 183.1  | 89,483             |
+| Engine                | Batch Size | Seq Length | Tokenization Latency (ms) | Inference Latency (ms) | Post-processing Latency (ms) | End-to-End Latency (ms) | Throughput (tokens/sec) |
+|-----------------------|------------|------------|---------------------------|------------------------|------------------------------|-------------------------|-------------------------|
+| Sage+Compile(no-attn) | 2          | 2048       | 6.7                       | 37.4                   | 0.4                          | 44.6                    | 91,799                  |
+| Sage+Compile(no-attn) | 2          | 3072       | 10.8                      | 62.9                   | 0.2                          | 74.1                    | 82,931                  |
+| Sage+Compile(no-attn) | 2          | 4096       | 13.5                      | 87.4                   | 0.2                          | 101.3                   | 80,904                  |
+| Sage+Compile(no-attn) | 2          | 8192       | 28.0                      | 221.2                  | 0.3                          | 249.6                   | 65,636                  |
+| Sage+Compile(no-attn) | 4          | 2048       | 11.3                      | 73.1                   | 0.3                          | 84.8                    | 96,593                  |
+| Sage+Compile(no-attn) | 4          | 3072       | 17.3                      | 113.8                  | 0.3                          | 131.5                   | 93,437                  |
+| Sage+Compile(no-attn) | 4          | 4096       | 22.5                      | 164.2                  | 0.3                          | 187.1                   | 87,577                  |
+| Sage+Compile(no-attn) | 4          | 8192       | 46.2                      | 430.3                  | 0.3                          | 477.0                   | 68,693                  |
 
 ## Results Files
 

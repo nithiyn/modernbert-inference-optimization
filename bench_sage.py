@@ -168,7 +168,7 @@ def parse_args():
     p.add_argument("--compile_dynamic", action="store_true", default=True, help="Enable dynamic=True")
     #p.add_argument("--fullgraph", action="store_true", help="Enable fullgraph=True (usually False with Sage)")
     p.add_argument("--batch_sizes", type=int, nargs="+", default=[2, 4], help="Batch sizes")
-    p.add_argument("--max_lengths", type=int, nargs="+", default=[2048, 3072, 4096], help="Seq lengths")
+    p.add_argument("--max_lengths", type=int, nargs="+", default=[2048, 3072, 4096, 8192], help="Seq lengths")
     p.add_argument("--num_sample", type=int, default=200, help="Iterations per config")
     p.add_argument("--warmup", type=int, default=5, help="Initial warmup iters")
     p.add_argument("--report_memory", action="store_true", help="Report peak CUDA memory (MB)")
@@ -326,9 +326,9 @@ if __name__ == "__main__":
     print("=" * 80 + "\n")
 
     print("\nSummary Table:")
-    headers = ["Engine", "Batch", "Seq", "Tok ms", "Infer ms", "E2E ms", "Throughput (tok/s)"]
-    print(f"{headers[0]:<12} {headers[1]:<6} {headers[2]:<6} {headers[3]:<8} {headers[4]:<9} {headers[5]:<8} {headers[6]:<18}")
-    print("=" * 90)
+    headers = ["Engine", "Batch", "Seq", "Tok ms", "Infer ms", "Post ms", "E2E ms", "Throughput (tok/s)"]
+    print(f"{headers[0]:<12} {headers[1]:<6} {headers[2]:<6} {headers[3]:<8} {headers[4]:<9} {headers[5]:<9} {headers[6]:<8} {headers[7]:<18}")
+    print("=" * 99)
     for r in all_results:
         print(
             f"{r['engine']:<12} "
@@ -336,6 +336,7 @@ if __name__ == "__main__":
             f"{r['max_length']:<6} "
             f"{r['avg_tokenize_ms']:<8.1f} "
             f"{r['avg_inference_ms']:<9.1f} "
+            f"{r['avg_postprocess_ms']:<9.1f} "
             f"{r['avg_e2e_ms']:<8.1f} "
             f"{r['throughput_samples_per_sec']:<18.2f} "
         )

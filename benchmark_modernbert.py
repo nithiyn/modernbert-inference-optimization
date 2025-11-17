@@ -235,7 +235,7 @@ if __name__ == "__main__":
 
     # Print summary table
     print("\nSummary Table:")
-    print(f"{'Batch Size':<12} {'Seq Length':<12} {'Tokenize (ms)':<15} {'Inference (ms)':<16} {'E2E (ms)':<12} {'Throughput (tok/s)':<20}")
-    print("=" * 100)
+    print(f"{'Batch Size':<12} {'Seq Length':<12} {'Tokenize (ms)':<15} {'Inference (ms)':<16} {'Postproc (ms)':<15} {'E2E (ms)':<12} {'Throughput (tok/s)':<20}")
+    print("=" * 115)
     for result in all_results:
-        print(f"{result['batch_size']:<12} {result['max_length']:<12} {result['avg_tokenize_ms']:<15.3f} {result['avg_inference_ms']:<16.3f} {result['avg_e2e_ms']:<12.3f} {result['throughput_tokens_per_sec']:<20.2f}")
+        print(f"{result['batch_size']:<12} {result['max_length']:<12} {result['avg_tokenize_ms']:<15.3f} {result['avg_inference_ms']:<16.3f} {result['avg_postprocess_ms']:<15.3f} {result['avg_e2e_ms']:<12.3f} {result['throughput_tokens_per_sec']:<20.2f}")
