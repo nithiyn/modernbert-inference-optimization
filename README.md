@@ -415,7 +415,7 @@ View Chrome traces at `chrome://tracing` or https://ui.perfetto.dev/
 
 ## Key Takeaways
 
-- **torch.compile (Inductor) + FA2** delivers the best inference performance with dynamic shape support and excellent warmup behavior (125k-143k tok/s throughput)
+- **torch.compile (Inductor) + FA2** delivers the best inference performance and excellent warmup behavior for static shapes (125k-143k tok/s throughput)
 - **torch.compile (TensorRT backend)** performs similarly to eager baseline, indicating FA2 kernels aren't being optimized by TensorRT in JIT mode
 - **SageAttention + Compile (no-attn)** provides competitive performance when attention is excluded from Triton compilation (81k-99k tok/s)
 - **Eager baseline** with FA2 shows solid performance (100k-125k tok/s) without compilation overhead
